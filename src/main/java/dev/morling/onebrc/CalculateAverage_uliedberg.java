@@ -20,16 +20,18 @@ import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.IntPredicate;
 import java.util.function.IntUnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 
 public class CalculateAverage_uliedberg {
     private static final String FILE_PATH = "./measurements.txt";
@@ -95,9 +97,11 @@ public class CalculateAverage_uliedberg {
     }
 
     // TODO: shouldn't copy the bytes, will be done in string as well
-    private static String convertToString(ByteBuffer buffer) {
-        byte[] bytes = new byte[buffer.remaining()];
-        buffer.get(bytes);
+    private static String convertToString(MemorySegmentWithHash segmentWithHash) {
+        var segment = segmentWithHash.segment();
+        var len = (int) segment.byteSize();
+        byte[] bytes = new byte[len];
+        MemorySegment.copy(segment, JAVA_BYTE, 0, bytes, 0, len);
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
@@ -142,9 +146,8 @@ public class CalculateAverage_uliedberg {
                 segmentStartAfterFirstNewline, segmentEndWithLastNewline - segmentStartAfterFirstNewline);
     }
 
-    // TODO: possible to pre-calc hashcode for the station in the row loop
-    private static Map<ByteBuffer, MutableAccumulator> accumulateChunk(MemorySegment segment) {
-        Map<ByteBuffer, MutableAccumulator> chunkMap = new HashMap<>();
+    private static Map<MemorySegmentWithHash, MutableAccumulator> accumulateChunk(MemorySegment segment) {
+        Map<MemorySegmentWithHash, MutableAccumulator> chunkMap = new HashMap<>();
 
         long position = 0;
         while (position < segment.byteSize()) {
@@ -152,6 +155,7 @@ public class CalculateAverage_uliedberg {
             var isStationPart = true;
             long s = 0;
             long v = 0;
+            int stationHash = 1;
 
             byte b;
             while ((b = segment.get(ValueLayout.JAVA_BYTE, position++)) != '\n') {
@@ -161,6 +165,7 @@ public class CalculateAverage_uliedberg {
                 }
                 if (isStationPart) {
                     s++;
+                    stationHash = 31 * stationHash + (int) b;
                 }
                 else {
                     v++;
@@ -171,7 +176,7 @@ public class CalculateAverage_uliedberg {
             var valueHigh = valueLow + v;
 
             var measurement = Measurement.parse(
-                    segment.asSlice(rowStart, stationHigh - rowStart),
+                    MemorySegmentWithHash.from(segment.asSlice(rowStart, stationHigh - rowStart), stationHash),
                     segment.asSlice(valueLow, valueHigh - valueLow));
 
             chunkMap.compute(
@@ -182,13 +187,32 @@ public class CalculateAverage_uliedberg {
         return chunkMap;
     }
 
-    // Note: using ByteBuffer for easily available hash-function
-    public record Measurement(ByteBuffer station, int value) {
+    public record MemorySegmentWithHash(MemorySegment segment, int hash) {
 
-        public static Measurement parse(MemorySegment stationData, MemorySegment valueData) {
-            var station = stationData.asByteBuffer();
+        public static MemorySegmentWithHash from(MemorySegment segment, int hash) {
+            return new MemorySegmentWithHash(segment, hash);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        // Note: questionable, but could just do the hash comparison. Goes from ~4.3s to ~3.5s on my machine
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            MemorySegmentWithHash that = (MemorySegmentWithHash) o;
+            return this.hash == that.hash && this.segment.asByteBuffer().equals(that.segment.asByteBuffer());
+        }
+    }
+
+    public record Measurement(MemorySegmentWithHash station, int value) {
+
+        public static Measurement parse(MemorySegmentWithHash stationData, MemorySegment valueData) {
             var value = parseValue(valueData);
-            return new Measurement(station, value);
+            return new Measurement(stationData, value);
         }
 
         static int parseValue(MemorySegment segment) {
@@ -205,6 +229,12 @@ public class CalculateAverage_uliedberg {
                     + digitAt.applyAsInt(2) * 10
                     // skip the decimal point at 1
                     + digitAt.applyAsInt(0));
+        }
+
+        // For debugging
+        @Override
+        public String toString() {
+            return STR."{station: \{convertToString(station)}, station hash: \{station.hash}, value: \{value}}";
         }
     }
 
