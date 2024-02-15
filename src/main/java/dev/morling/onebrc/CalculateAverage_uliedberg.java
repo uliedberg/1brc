@@ -24,25 +24,29 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Objects;
-import java.util.TreeMap;
 import java.util.function.IntPredicate;
 import java.util.function.IntUnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import static java.lang.foreign.ValueLayout.JAVA_BYTE;
-
+/**
+ * Had a lof of fun with this! The preview Foreign Function & Memory API was nicer to work with than
+ * ByteBuffer for sure.</br>
+ *
+ * On my machine (MacBook Pro, 2021, M1 Pro (10 cores), 32GB) on non-initial runs:
+ * - baseline: ~3m 15s
+ * - this version: ~4,5s
+ * - thomaswue (top spot): ~1,3s
+ */
 public class CalculateAverage_uliedberg {
     private static final String FILE_PATH = "./measurements.txt";
+    // 100 bytes for station name + max ";-99.9\n" for remaining
+    private static final int MAX_ROW_SIZE = 107;
 
     public static void main(String[] args) {
 
         final File file = new File(FILE_PATH);
         final long fileSize = file.length();
-
-        // 100 bytes for station name + max ";-99.9\n" for remaining
-        final int MAX_ROW_SIZE = 107;
 
         final int cores = Runtime.getRuntime().availableProcessors();
         // Last chunk size will be the remaining file size
@@ -63,13 +67,11 @@ public class CalculateAverage_uliedberg {
                                         chunkIndex,
                                         numberOfChunks,
                                         defaultChunkSize,
-                                        fileSize,
-                                        MAX_ROW_SIZE);
+                                        fileSize);
 
                                 return accumulateChunk(memorySegment);
                             });
 
-            // TODO: reduce more efficiently?
             // Note: toConcurrentMap seems to be the same performance as toMap
             var accumulatorMap = accumulatorStreams
                     .flatMap(map -> map.entrySet().stream())
@@ -77,18 +79,15 @@ public class CalculateAverage_uliedberg {
                             Collectors.toConcurrentMap(
                                     Map.Entry::getKey, Map.Entry::getValue, MutableAccumulator::merge));
 
-            // TODO: sort could be better? Maybe only use String in te printing? Same for the value though...
-            var outputMap = accumulatorMap.entrySet().stream()
-                    .collect(
-                            Collectors.toMap(
-                                    e -> convertToString(e.getKey()),
-                                    e -> e.getValue().toStringPresentation(),
-                                    (v1, v2) -> {
-                                        throw new RuntimeException("No duplicates expected");
-                                    },
-                                    TreeMap::new));
+            // Note: parallel seems to be around the same performance, maybe different for 10k station input? Still small-ish
+            var output = accumulatorMap.entrySet().stream()
+                    .parallel()
+                    .map(e -> Map.entry(convertToString(e.getKey()), e.getValue()))
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(e -> STR."\{e.getKey()}=\{e.getValue().toStringPresentation()}")
+                    .collect(Collectors.joining(", ", "{", "}"));
 
-            System.out.println(outputMap);
+            System.out.println(output);
 
         }
         catch (Exception e) {
@@ -96,12 +95,12 @@ public class CalculateAverage_uliedberg {
         }
     }
 
-    // TODO: shouldn't copy the bytes, will be done in string as well
+    // Re-implementation-ish of SharedUtils.toJavaStringInternal
     private static String convertToString(MemorySegmentWithHash segmentWithHash) {
         var segment = segmentWithHash.segment();
         var len = (int) segment.byteSize();
         byte[] bytes = new byte[len];
-        MemorySegment.copy(segment, JAVA_BYTE, 0, bytes, 0, len);
+        MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, 0, bytes, 0, len);
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
@@ -113,14 +112,15 @@ public class CalculateAverage_uliedberg {
                                                     int chunkIndex,
                                                     int numberOfChunks,
                                                     long defaultChunkSize,
-                                                    long fileSize,
-                                                    int maxRowSize) {
+                                                    long fileSize) {
 
         IntPredicate isFirstChunk = n -> n == 0;
         IntPredicate isLastChunk = n -> n == numberOfChunks - 1;
 
         long chunkStart = chunkIndex * defaultChunkSize;
-        long chunkSize = isLastChunk.test(chunkIndex) ? (fileSize - chunkStart) : (defaultChunkSize + maxRowSize);
+        long chunkSize = isLastChunk.test(chunkIndex)
+                ? (fileSize - chunkStart)
+                : (defaultChunkSize + CalculateAverage_uliedberg.MAX_ROW_SIZE);
 
         MemorySegment memorySegment = fileMemorySegment.asSlice(chunkStart, chunkSize);
 
@@ -135,7 +135,7 @@ public class CalculateAverage_uliedberg {
 
         long segmentEndWithLastNewline = chunkSize;
         if (!isLastChunk.test(chunkIndex)) {
-            position = chunkSize - maxRowSize;
+            position = chunkSize - CalculateAverage_uliedberg.MAX_ROW_SIZE;
             // Get end position for last complete line
             while (memorySegment.get(ValueLayout.JAVA_BYTE, position++) != '\n') {
             }
@@ -155,7 +155,7 @@ public class CalculateAverage_uliedberg {
             var isStationPart = true;
             long s = 0;
             long v = 0;
-            int stationHash = 1;
+            int stationHash = 1; // initial seed
 
             byte b;
             while ((b = segment.get(ValueLayout.JAVA_BYTE, position++)) != '\n') {
@@ -165,7 +165,7 @@ public class CalculateAverage_uliedberg {
                 }
                 if (isStationPart) {
                     s++;
-                    stationHash = 31 * stationHash + (int) b;
+                    stationHash = hashCode(b, stationHash);
                 }
                 else {
                     v++;
@@ -187,6 +187,10 @@ public class CalculateAverage_uliedberg {
         return chunkMap;
     }
 
+    private static int hashCode(byte b, int initialValue) {
+        return 31 * initialValue + (int) b;
+    }
+
     public record MemorySegmentWithHash(MemorySegment segment, int hash) {
 
         public static MemorySegmentWithHash from(MemorySegment segment, int hash) {
@@ -198,7 +202,7 @@ public class CalculateAverage_uliedberg {
             return hash;
         }
 
-        // Note: questionable, but could just do the hash comparison. Goes from ~4.3s to ~3.5s on my machine
+        // Note: speeding up this would gain a lot.
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
@@ -277,18 +281,20 @@ public class CalculateAverage_uliedberg {
 
         // Final presentation, int -> double -> String
         public String toStringPresentation() {
-            return STR."\{round((double) min / 10)}/\{round((double) sum / 10 / count)}/\{round((double) max / 10)}";
+            var minP = (double) min / 10;
+            var maxP = (double) max / 10;
+            var meanP = round((double) sum / 10 / count);
+            return STR."\{minP}/\{meanP}/\{maxP}";
         }
 
         private static double round(double value) {
             return Math.round(value * 10.0) / 10.0;
         }
 
-        // Note - used for debugging
+        // For debugging
         @Override
         public String toString() {
             return STR."{min: \{min}, max: \{max}, sum: \{sum}, count: \{count}}";
         }
     }
-
 }
